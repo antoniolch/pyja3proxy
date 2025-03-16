@@ -12,7 +12,7 @@ def setup_logging(debug_mode):
     """Sets up logging configuration."""
     log_level = logging.DEBUG if debug_mode else logging.INFO
     logging.basicConfig(
-        filename="proxy.log",  # Logs stored in proxy.log
+        filename="proxy.log",
         filemode="a",
         format="%(asctime)s - %(levelname)s - %(message)s",
         level=log_level
@@ -35,7 +35,7 @@ def handle_client(client_socket, impersonate, debug_mode):
         logging.info(f"Received request: {first_line.strip()}")
 
         if method == "CONNECT":
-            handle_https(client_socket, url)
+            handle_https(client_socket, url, impersonate)
         else:
             handle_http(client_socket, request, url, impersonate)
 
@@ -44,7 +44,7 @@ def handle_client(client_socket, impersonate, debug_mode):
         client_socket.close()
 
 def handle_http(client_socket, request, url, impersonate):
-    """Handles HTTP/1.1 and HTTP/2 forwarding."""
+    """Handles both HTTP/1.1 and HTTP/2 requests."""
     try:
         http_pos = url.find("://")
         if http_pos != -1:
@@ -76,8 +76,8 @@ def handle_http(client_socket, request, url, impersonate):
     finally:
         client_socket.close()
 
-def handle_https(client_socket, url):
-    """Handles HTTPS CONNECT requests by establishing a tunnel."""
+def handle_https(client_socket, url, impersonate):
+    """Handles HTTPS CONNECT requests and supports HTTP/1.1 & HTTP/2."""
     try:
         host, port = url.split(":")
         port = int(port)
@@ -89,22 +89,31 @@ def handle_https(client_socket, url):
 
         client_socket.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
 
-        sockets = [client_socket, server_socket]
-        while True:
-            read_sockets, _, _ = select.select(sockets, [], [])
-            for sock in read_sockets:
-                data = sock.recv(BUFFER_SIZE)
-                if not data:
-                    client_socket.close()
-                    server_socket.close()
-                    return
-                if sock is client_socket:
-                    server_socket.sendall(data)
-                else:
-                    client_socket.sendall(data)
+        # Determine if the request is HTTP/2
+        try:
+            response = curl_requests.get(f"https://{host}:{port}", impersonate=impersonate)
+            is_http2 = response.http_version == "HTTP/2"
+        except Exception:
+            is_http2 = False
+
+        if is_http2:
+            logging.info(f"Handling HTTPS as HTTP/2 for {host}:{port}")
+            response = curl_requests.get(f"https://{host}:{port}", impersonate=impersonate)
+        else:
+            logging.info(f"Handling HTTPS as HTTP/1.1 for {host}:{port}")
+            response = requests.get(f"https://{host}:{port}")
+
+        client_socket.sendall(
+            f"HTTP/1.1 {response.status_code} OK\r\n".encode() +
+            b"\r\n".join([f"{k}: {v}".encode() for k, v in response.headers.items()]) +
+            b"\r\n\r\n" + response.content
+        )
+
+        logging.info(f"HTTPS Response: {response.status_code} - {len(response.content)} bytes")
 
     except Exception as e:
         logging.error(f"HTTPS Proxy Error: {e}")
+    finally:
         client_socket.close()
 
 def start_proxy(interface, port, impersonate, debug_mode):
