@@ -44,10 +44,6 @@ curl -x http://127.0.0.1:8080 http://example.com
 ```sh
 curl -x http://127.0.0.1:8080 https://example.com -k
 ```
-### **3️⃣ Test HTTP/2 with Chrome 131 Impersonation**
-```sh
-curl --http2 -x http://127.0.0.1:8080 https://www.google.com -k
-```
 
 ## 📜 Features
 ✅ **Supports HTTP & HTTPS requests**  
