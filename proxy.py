@@ -11,27 +11,29 @@ from curl_cffi import requests
 
 logger = logging.getLogger("proxy")
 
-# Define our own impersonation function.
+# Define a dynamic impersonation function.
 def impersonate(browser):
     """
     Patch curl_cffi.requests.request to add a default User-Agent header.
-    Currently supports only "chrome131", which uses a Chrome 131 User-Agent string.
+    Currently supports impersonation for "chrome131". Extend as needed.
     """
     if browser.lower() == "chrome131":
         user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
-        original_request = requests.request
-
-        def new_request(method, url, **kwargs):
-            headers = kwargs.get("headers", {})
-            if "User-Agent" not in headers:
-                headers["User-Agent"] = user_agent
-            kwargs["headers"] = headers
-            return original_request(method, url, **kwargs)
-
-        requests.request = new_request
-        logger.debug("Impersonation enabled: using Chrome 131 User-Agent")
     else:
-        logger.warning("Impersonation for browser '%s' is not implemented.", browser)
+        logger.warning("Impersonation for browser '%s' is not implemented. No changes made.", browser)
+        return
+
+    original_request = requests.request
+
+    def new_request(method, url, **kwargs):
+        headers = kwargs.get("headers", {})
+        if "User-Agent" not in headers:
+            headers["User-Agent"] = user_agent
+        kwargs["headers"] = headers
+        return original_request(method, url, **kwargs)
+
+    requests.request = new_request
+    logger.debug("Impersonation enabled: using %s User-Agent", browser)
 
 class ProxyHandler(socketserver.StreamRequestHandler):
     def handle(self):
@@ -163,7 +165,7 @@ class ProxyHandler(socketserver.StreamRequestHandler):
 
         # Feed the initial data (including the preface) into the H2 connection.
         events = conn.receive_data(initial_data)
-        stream_data = {}   # Maps stream_id to accumulated body bytes.
+        stream_data = {}      # Maps stream_id to accumulated body bytes.
         request_headers = {}  # Maps stream_id to received headers.
         ended_streams = set()
 
@@ -235,14 +237,13 @@ class ProxyHandler(socketserver.StreamRequestHandler):
                 response_headers = [(':status', str(resp.status_code))]
                 for key, value in resp.headers.items():
                     response_headers.append((key.lower(), value))
-                # For HEAD requests, only send headers.
                 if method.upper() == "HEAD":
                     conn.send_headers(stream_id, response_headers, end_stream=True)
                 else:
                     conn.send_headers(stream_id, response_headers)
                     conn.send_data(stream_id, resp.content, end_stream=True)
                 self.connection.sendall(conn.data_to_send())
-                # For simplicity, process only one stream.
+                # Process only one stream for simplicity.
                 break
 
 if __name__ == "__main__":
@@ -251,7 +252,7 @@ if __name__ == "__main__":
     )
     parser.add_argument("--interface", default="0.0.0.0", help="Interface to bind to (default: 0.0.0.0)")
     parser.add_argument("--port", type=int, default=8080, help="Port to listen on (default: 8080)")
-    parser.add_argument("--impersonate", action="store_true", help="Use impersonation (chrome131) for outbound requests")
+    parser.add_argument("--impersonate", type=str, default="", help="Use impersonation for outbound requests (e.g. chrome131)")
     parser.add_argument("--debug", action="store_true", help="Enable debug logging")
     args = parser.parse_args()
 
@@ -262,7 +263,7 @@ if __name__ == "__main__":
 
     # Apply impersonation if requested.
     if args.impersonate:
-        impersonate("chrome131")
+        impersonate(args.impersonate)
 
     class ThreadedTCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
         allow_reuse_address = True
