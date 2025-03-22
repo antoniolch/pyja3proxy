@@ -1,167 +1,277 @@
-import socket
-import threading
-import select
-import requests
-import logging
+#!/usr/bin/env python3
 import argparse
-from mitmproxy import proxy, options
-from mitmproxy.tools.dump import DumpMaster
-from curl_cffi import requests as curl_requests
+import socket
+import socketserver
+import threading
+import ssl
+import logging
 
-BUFFER_SIZE = 4096
+# Import the requests module from curl_cffi.
+from curl_cffi import requests
 
-def setup_logging(debug_mode):
-    """Sets up logging configuration."""
-    log_level = logging.DEBUG if debug_mode else logging.INFO
-    logging.basicConfig(
-        filename="proxy.log",
-        filemode="a",
-        format="%(asctime)s - %(levelname)s - %(message)s",
-        level=log_level
-    )
-    console_handler = logging.StreamHandler()
-    console_handler.setLevel(log_level)
-    logging.getLogger().addHandler(console_handler)
+logger = logging.getLogger("proxy")
 
-class MitmProxy(DumpMaster):
-    """MITM Proxy for intercepting HTTPS traffic."""
+# Define our own impersonation function.
+def impersonate(browser):
+    """
+    Patch curl_cffi.requests.request to add a default User-Agent header.
+    Currently supports only "chrome131", which uses a Chrome 131 User-Agent string.
+    """
+    if browser.lower() == "chrome131":
+        user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+        original_request = requests.request
 
-    def __init__(self, options):
-        super().__init__(options)
-    
-    def request(self, flow):
-        """Intercept and modify HTTP/HTTPS requests here."""
-        logging.info(f"Intercepted Request: {flow.request.method} {flow.request.url}")
-        
-        # Example modification: Add a custom header
-        flow.request.headers["X-Intercepted"] = "True"
-    
-    def response(self, flow):
-        """Intercept and modify responses."""
-        logging.info(f"Intercepted Response: {flow.response.status_code} {flow.request.url}")
-        
-        # Example modification: Modify response body (only if it's text)
-        if "text" in flow.response.headers.get("content-type", ""):
-            flow.response.text += "\n<!-- Intercepted by Proxy -->"
+        def new_request(method, url, **kwargs):
+            headers = kwargs.get("headers", {})
+            if "User-Agent" not in headers:
+                headers["User-Agent"] = user_agent
+            kwargs["headers"] = headers
+            return original_request(method, url, **kwargs)
 
-def run_mitm_proxy():
-    """Runs MITM Proxy for HTTPS decryption."""
-    opts = options.Options(listen_host="0.0.0.0", listen_port=8080, ssl_insecure=True)
-    proxy_config = proxy.config.ProxyConfig(opts)
-    m = MitmProxy(opts)
-    m.run()
+        requests.request = new_request
+        logger.debug("Impersonation enabled: using Chrome 131 User-Agent")
+    else:
+        logger.warning("Impersonation for browser '%s' is not implemented.", browser)
 
-def handle_client(client_socket, impersonate, debug_mode):
-    """Handles an incoming client connection."""
-    try:
-        request = client_socket.recv(BUFFER_SIZE)
-        if not request:
-            client_socket.close()
+class ProxyHandler(socketserver.StreamRequestHandler):
+    def handle(self):
+        try:
+            data = self.connection.recv(8192)
+            if not data:
+                return
+
+            # Check for HTTP/2 client connection preface.
+            if data.startswith(b"PRI * HTTP/2.0"):
+                logger.debug("Handling HTTP/2 connection")
+                self.handle_http2(data)
+            else:
+                # For HTTP/1.x: check if it's a CONNECT method (for HTTPS) or a standard HTTP request.
+                first_line = data.splitlines()[0].decode('utf-8', errors='replace')
+                parts = first_line.split()
+                if len(parts) < 3:
+                    return
+                method = parts[0].upper()
+                if method == "CONNECT":
+                    logger.debug("Handling CONNECT request for %s", parts[1])
+                    self.handle_connect(parts[1])
+                else:
+                    logger.debug("Handling HTTP/1.x request: %s", first_line)
+                    self.handle_http(data)
+        except Exception as e:
+            logger.exception("Error handling request: %s", e)
+
+    def handle_connect(self, target):
+        """
+        Handle HTTPS tunneling via the CONNECT method.
+        """
+        try:
+            host, port = target.split(":")
+            port = int(port)
+        except Exception as e:
+            logger.error("Invalid CONNECT target: %s", target)
+            self.connection.sendall(b"HTTP/1.1 400 Bad Request\r\n\r\n")
             return
 
-        first_line = request.decode().split("\n")[0]
-        method, url, *_ = first_line.split()
+        try:
+            remote = socket.create_connection((host, port))
+            self.connection.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+        except Exception as e:
+            logger.error("Error connecting to remote %s:%s - %s", host, port, e)
+            self.connection.sendall(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
+            return
 
-        logging.info(f"Received request: {first_line.strip()}")
+        self.tunnel(self.connection, remote)
 
-        if method == "CONNECT":
-            handle_https(client_socket, url)
-        else:
-            handle_http(client_socket, request, url, impersonate)
+    def tunnel(self, client, remote):
+        """
+        Bidirectionally forward data between client and remote.
+        """
+        def forward(source, destination):
+            try:
+                while True:
+                    data = source.recv(4096)
+                    if not data:
+                        break
+                    destination.sendall(data)
+            except Exception:
+                pass
+            finally:
+                try:
+                    destination.shutdown(socket.SHUT_WR)
+                except Exception:
+                    pass
 
-    except Exception as e:
-        logging.error(f"Error handling client: {e}")
-        client_socket.close()
+        t1 = threading.Thread(target=forward, args=(client, remote))
+        t2 = threading.Thread(target=forward, args=(remote, client))
+        t1.start()
+        t2.start()
+        t1.join()
+        t2.join()
 
-def handle_http(client_socket, request, url, impersonate):
-    """Handles both HTTP/1.1 and HTTP/2 requests."""
-    try:
-        http_pos = url.find("://")
-        if http_pos != -1:
-            url = url[(http_pos + 3):]
-        port_pos = url.find(":")
-        if port_pos == -1:
-            host = url.split("/")[0]
-            port = 80
-        else:
-            host = url[:port_pos]
-            port = int(url[(port_pos + 1):].split("/")[0])
+    def handle_http(self, initial_data):
+        """
+        Handle an HTTP/1.x request: parse the request, forward it via curl_cffi.requests,
+        and return the response back to the client. All HTTP verbs are forwarded.
+        For HEAD requests, no response body is returned.
+        """
+        try:
+            lines = initial_data.split(b'\r\n')
+            request_line = lines[0].decode('utf-8', errors='replace')
+            method, url, protocol = request_line.split()
+            headers = {}
+            i = 1
+            while i < len(lines):
+                line = lines[i].decode('utf-8', errors='replace')
+                i += 1
+                if line == "":
+                    break
+                if ':' in line:
+                    key, value = line.split(":", 1)
+                    headers[key.strip()] = value.strip()
+            body = b'\r\n'.join(lines[i:]) if i < len(lines) else None
 
-        logging.info(f"Forwarding HTTP request to {host}:{port}")
+            logger.debug("Forwarding HTTP/1.x request to %s with verb %s", url, method)
+            resp = requests.request(method, url, headers=headers, data=body, verify=True)
 
-        if b"HTTP/2" in request:
-            response = curl_requests.get(f"http://{host}:{port}", impersonate=impersonate)
-        else:
-            response = requests.get(f"http://{host}:{port}")
+            # Build the response headers.
+            response_data = f"HTTP/1.1 {resp.status_code} {resp.reason}\r\n"
+            for key, value in resp.headers.items():
+                response_data += f"{key}: {value}\r\n"
+            response_data += "\r\n"
+            self.connection.sendall(response_data.encode('utf-8'))
+            # For HEAD requests, do not send the body.
+            if method.upper() != "HEAD":
+                self.connection.sendall(resp.content)
+        except Exception as e:
+            logger.exception("Error handling HTTP/1.x request: %s", e)
+            error_response = "HTTP/1.1 500 Internal Server Error\r\n\r\n"
+            self.connection.sendall(error_response.encode('utf-8'))
 
-        client_socket.sendall(
-            f"HTTP/1.1 {response.status_code} OK\r\n".encode() +
-            b"\r\n".join([f"{k}: {v}".encode() for k, v in response.headers.items()]) +
-            b"\r\n\r\n" + response.content
-        )
-        logging.info(f"Response: {response.status_code} - {len(response.content)} bytes")
+    def handle_http2(self, initial_data):
+        """
+        Handle a basic HTTP/2 (h2c) connection. This simplified implementation uses
+        hyper-h2 to process HTTP/2 frames, extract the request, forward it via curl_cffi.requests,
+        and then send back an HTTP/2 response. All HTTP verbs are supported.
+        For HEAD requests, no response body is returned.
+        """
+        from h2.connection import H2Connection
+        from h2.events import RequestReceived, DataReceived, StreamEnded
 
-    except Exception as e:
-        logging.error(f"HTTP Proxy Error: {e}")
-    finally:
-        client_socket.close()
+        conn = H2Connection(client_side=False)
+        conn.initiate_connection()
+        self.connection.sendall(conn.data_to_send())
 
-def handle_https(client_socket, url):
-    """Handles HTTPS CONNECT requests correctly by tunneling encrypted data."""
-    try:
-        host, port = url.split(":")
-        port = int(port)
+        # Feed the initial data (including the preface) into the H2 connection.
+        events = conn.receive_data(initial_data)
+        stream_data = {}   # Maps stream_id to accumulated body bytes.
+        request_headers = {}  # Maps stream_id to received headers.
+        ended_streams = set()
 
-        logging.info(f"Establishing HTTPS tunnel to {host}:{port}")
+        # Process any events already received.
+        for event in events:
+            if isinstance(event, RequestReceived):
+                stream_id = event.stream_id
+                request_headers[stream_id] = event.headers
+                stream_data[stream_id] = b""
+            elif isinstance(event, DataReceived):
+                stream_id = event.stream_id
+                stream_data.setdefault(stream_id, b"")
+                stream_data[stream_id] += event.data
+                conn.acknowledge_received_data(event.flow_controlled_length, stream_id)
+            elif isinstance(event, StreamEnded):
+                ended_streams.add(event.stream_id)
+        self.connection.sendall(conn.data_to_send())
 
-        server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        server_socket.connect((host, port))
+        # Read further data until at least one stream ends.
+        while not ended_streams:
+            data = self.connection.recv(8192)
+            if not data:
+                break
+            events = conn.receive_data(data)
+            for event in events:
+                if isinstance(event, RequestReceived):
+                    stream_id = event.stream_id
+                    request_headers[stream_id] = event.headers
+                    stream_data[stream_id] = b""
+                elif isinstance(event, DataReceived):
+                    stream_id = event.stream_id
+                    stream_data.setdefault(stream_id, b"")
+                    stream_data[stream_id] += event.data
+                    conn.acknowledge_received_data(event.flow_controlled_length, stream_id)
+                elif isinstance(event, StreamEnded):
+                    ended_streams.add(event.stream_id)
+            self.connection.sendall(conn.data_to_send())
 
-        client_socket.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+        # Process the first completed stream.
+        for stream_id, headers in request_headers.items():
+            if stream_id in ended_streams:
+                # Separate pseudo-headers from standard headers.
+                headers_dict = {}
+                pseudo_headers = {}
+                for name, value in headers:
+                    if name.startswith(":"):
+                        pseudo_headers[name] = value
+                    else:
+                        headers_dict[name] = value
 
-        sockets = [client_socket, server_socket]
-        while True:
-            read_sockets, _, _ = select.select(sockets, [], [])
-            for sock in read_sockets:
-                data = sock.recv(BUFFER_SIZE)
-                if not data:
-                    client_socket.close()
-                    server_socket.close()
-                    return
-                if sock is client_socket:
-                    server_socket.sendall(data)
+                method = pseudo_headers.get(":method", "GET")
+                scheme = pseudo_headers.get(":scheme", "http")
+                authority = pseudo_headers.get(":authority", "")
+                path = pseudo_headers.get(":path", "/")
+                url = f"{scheme}://{authority}{path}"
+                body = stream_data.get(stream_id, None)
+
+                logger.debug("Forwarding HTTP/2 request to %s with verb %s", url, method)
+                try:
+                    resp = requests.request(method, url, headers=headers_dict, data=body, verify=True)
+                except Exception as e:
+                    logger.exception("Error in HTTP/2 request: %s", e)
+                    error_headers = [(':status', '500')]
+                    conn.send_headers(stream_id, error_headers, end_stream=True)
+                    self.connection.sendall(conn.data_to_send())
+                    continue
+
+                # Build response headers. The pseudo-header :status is required.
+                response_headers = [(':status', str(resp.status_code))]
+                for key, value in resp.headers.items():
+                    response_headers.append((key.lower(), value))
+                # For HEAD requests, only send headers.
+                if method.upper() == "HEAD":
+                    conn.send_headers(stream_id, response_headers, end_stream=True)
                 else:
-                    client_socket.sendall(data)
-
-    except Exception as e:
-        logging.error(f"HTTPS Proxy Tunnel Error: {e}")
-        client_socket.close()
-
-def start_proxy(interface, port, impersonate, debug_mode):
-    """Starts the proxy server."""
-    setup_logging(debug_mode)
-
-    # Run MITM Proxy for HTTPS decryption
-    threading.Thread(target=run_mitm_proxy, daemon=True).start()
-
-    proxy_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    proxy_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    proxy_socket.bind((interface, port))
-    proxy_socket.listen(100)
-
-    logging.info(f"Proxy Server Listening on {interface}:{port} (Impersonating {impersonate})")
-
-    while True:
-        client_sock, _ = proxy_socket.accept()
-        threading.Thread(target=handle_client, args=(client_sock, impersonate, debug_mode)).start()
+                    conn.send_headers(stream_id, response_headers)
+                    conn.send_data(stream_id, resp.content, end_stream=True)
+                self.connection.sendall(conn.data_to_send())
+                # For simplicity, process only one stream.
+                break
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Python HTTP/HTTPS Proxy with Interception")
-    parser.add_argument("--interface", type=str, default="0.0.0.0", help="IP address to bind (default: 0.0.0.0)")
-    parser.add_argument("--port", type=int, default=8080, help="Port number to listen on (default: 8080)")
-    parser.add_argument("--impersonate", type=str, default="chrome131", help="Chrome version to impersonate (default: chrome131)")
+    parser = argparse.ArgumentParser(
+        description="Transparent HTTP/HTTPS proxy with HTTP/2 support handling all HTTP verbs using curl_cffi, hyper-h2, and argparse"
+    )
+    parser.add_argument("--interface", default="0.0.0.0", help="Interface to bind to (default: 0.0.0.0)")
+    parser.add_argument("--port", type=int, default=8080, help="Port to listen on (default: 8080)")
+    parser.add_argument("--impersonate", action="store_true", help="Use impersonation (chrome131) for outbound requests")
     parser.add_argument("--debug", action="store_true", help="Enable debug logging")
-
     args = parser.parse_args()
 
-    start_proxy(args.interface, args.port, args.impersonate, args.debug)
+    if args.debug:
+        logging.basicConfig(level=logging.DEBUG)
+    else:
+        logging.basicConfig(level=logging.INFO)
+
+    # Apply impersonation if requested.
+    if args.impersonate:
+        impersonate("chrome131")
+
+    class ThreadedTCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
+        allow_reuse_address = True
+
+    server_address = (args.interface, args.port)
+    with ThreadedTCPServer(server_address, ProxyHandler) as server:
+        logger.info("Proxy server running on %s:%s", args.interface, args.port)
+        try:
+            server.serve_forever()
+        except KeyboardInterrupt:
+            logger.info("Proxy server shutting down.")
+            server.shutdown()
