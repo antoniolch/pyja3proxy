@@ -11,7 +11,7 @@ This is a **fully functional HTTP/HTTPS proxy** written in Python. It supports:
 ## 📦 Requirements
 Install the necessary dependencies before running the proxy:
 ```sh
-pip install requests curl_cffi argparse
+pip install -r requirements
 ```
 
 ## 🚀 Running the Proxy
@@ -51,12 +51,7 @@ curl -x http://127.0.0.1:8080 https://example.com -k
 ✅ **Impersonates Chrome 131 using `curl_cffi`**  
 ✅ **Multi-threaded for handling multiple clients**  
 ✅ **Customizable via command-line arguments**  
-✅ **Logging support (`proxy.log`)**
-
-## 📌 Next Steps
-- 🔒 Add authentication support
-- 🚀 Implement caching
-- 🔍 Enable TLS inspection (Man-in-the-Middle Proxy)
+✅ **Logging support**
 
 ---
 ### 🛠️ Need Help?
